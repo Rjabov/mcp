@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/supabase/mcp/compare/mcp-server-supabase-v0.11.0...mcp-server-supabase-v0.11.1) (2026-08-21)
+
+
+### Bug Fixes
+
+* make server instructions intent-based instead of naming tools ([#372](https://github.com/supabase/mcp/issues/372)) ([fc54ea2](https://github.com/supabase/mcp/commit/fc54ea291e7c43e4501d8198d756d2c86a14538a))
+
 ## [0.11.0](https://github.com/supabase/mcp/compare/mcp-server-supabase-v0.10.0...mcp-server-supabase-v0.11.0) (2026-08-20)
 
 
