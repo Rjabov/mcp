@@ -470,7 +470,11 @@ describe('feature groups', () => {
     const { tools } = await client.listTools();
     const toolNames = tools.map((tool) => tool.name);
 
-    expect(toolNames).toEqual(['list_notebooks', 'get_notebook']);
+    expect(toolNames).toEqual([
+      'list_notebooks',
+      'get_notebook',
+      'run_notebook',
+    ]);
   });
 
   test('feedback tools', async () => {

@@ -66,6 +66,8 @@ export type SupabaseMcpServerOptions = {
    * The API URL for the Supabase Content API.
    */
   contentApiUrl?: string;
+  /** Dashboard base URL for notebook links. Defaults to the production dashboard. */
+  dashboardUrl?: string;
 
   /**
    * The project ID to scope the server to.
@@ -116,9 +118,11 @@ export type SupabaseMcpServerOptions = {
       ttlSeconds?: number;
     };
     /**
-     * Form confirmation for the listed cost and destructive SQL tools. Clients
-     * without form capability keep the existing SQL behavior and legacy
-     * `get_cost` -> `confirm_cost` -> `confirm_cost_id` flow.
+     * Form confirmation for the listed cost, destructive SQL and notebook
+     * tools. Clients without form capability run raw SQL without a prompt,
+     * but cannot run mutating notebook cells when confirmation is enabled.
+     * Cost tools keep the legacy `get_cost` -> `confirm_cost` ->
+     * `confirm_cost_id` flow.
      */
     confirmation?: {
       /** Tools that accept a confirmation elicitation. Empty disables all forms. */
@@ -182,6 +186,7 @@ export function createSupabaseMcpServer(options: SupabaseMcpServerOptions) {
     readOnly,
     features,
     contentApiUrl = 'https://supabase.com/docs/api/graphql',
+    dashboardUrl,
     onToolCall,
     observer,
     elicitation,
@@ -351,7 +356,24 @@ export function createSupabaseMcpServer(options: SupabaseMcpServerOptions) {
       }
 
       if (notebooks && enabledFeatures.has('notebooks')) {
-        Object.assign(tools, getNotebookTools({ notebooks, projectId }));
+        Object.assign(
+          tools,
+          getNotebookTools({
+            notebooks,
+            // Feature groups control tool discovery, not the operations that
+            // notebook cells can run. The notebooks group owns this tool.
+            database,
+            debugging,
+            projectId,
+            dashboardUrl,
+            readOnly,
+            confirmation:
+              elicitationCodec &&
+              enabledConfirmationTools.includes('run_notebook')
+                ? { codec: elicitationCodec }
+                : undefined,
+          })
+        );
       }
 
       if (feedback && enabledFeatures.has('feedback')) {

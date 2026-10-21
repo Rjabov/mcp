@@ -188,6 +188,7 @@ export function createServerHarness() {
             'create_branch',
             'execute_sql',
             'apply_migration',
+            'run_notebook',
           ],
         },
       },
@@ -196,6 +197,7 @@ export function createServerHarness() {
       elicitationAction,
       readOnly,
       projectId,
+      features,
     } = options;
     const platform =
       options.platform ??
@@ -214,7 +216,7 @@ export function createServerHarness() {
       platform,
       projectId,
       readOnly,
-      features: options.features,
+      features,
       observer: options.observer,
       onToolCall: options.onToolCall,
       elicitation: secretCollection
