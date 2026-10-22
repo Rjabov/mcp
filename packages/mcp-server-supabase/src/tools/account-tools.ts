@@ -5,6 +5,7 @@ import {
 } from '@modelcontextprotocol/server';
 import { type ToolObservation, tool } from '@supabase/mcp-utils';
 import type { ObservationFact } from '../observation.js';
+import { ToolCallerError } from '../errors.js';
 import { z } from 'zod/v4';
 import type { ToolDefs } from './util.js';
 import {
@@ -319,7 +320,9 @@ export function getAccountTools({
             route: 'blocked',
             reason: 'read_only',
           });
-          throw new Error('Cannot create a project in read-only mode.');
+          throw new ToolCallerError(
+            'Cannot create a project in read-only mode.'
+          );
         }
 
         if (confirmation && isFormCapable(ctx)) {
@@ -404,7 +407,7 @@ export function getAccountTools({
         // Legacy clients only: form-capable clients returned above. Without
         // this, a missing ID would hit the opaque hash-mismatch error below.
         if (!confirm_cost_id) {
-          throw new Error(missingConfirmCostIdMessage);
+          throw new ToolCallerError(missingConfirmCostIdMessage);
         }
 
         const cost = await getNextProjectCost(account, organization_id);
@@ -418,7 +421,7 @@ export function getAccountTools({
         });
         const costHash = await hashObject(cost);
         if (costHash !== confirm_cost_id) {
-          throw new Error(
+          throw new ToolCallerError(
             'Cost confirmation ID does not match the expected cost of creating a project.'
           );
         }
@@ -432,7 +435,9 @@ export function getAccountTools({
       ...accountToolDefs.pause_project,
       execute: async ({ project_id }) => {
         if (readOnly) {
-          throw new Error('Cannot pause a project in read-only mode.');
+          throw new ToolCallerError(
+            'Cannot pause a project in read-only mode.'
+          );
         }
 
         await account.pauseProject(project_id);
@@ -443,7 +448,9 @@ export function getAccountTools({
       ...accountToolDefs.restore_project,
       execute: async ({ project_id }) => {
         if (readOnly) {
-          throw new Error('Cannot restore a project in read-only mode.');
+          throw new ToolCallerError(
+            'Cannot restore a project in read-only mode.'
+          );
         }
 
         await account.restoreProject(project_id);
