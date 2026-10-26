@@ -357,8 +357,7 @@ describe('tools', () => {
     });
 
     const primaryKeys = (name: string) =>
-      result.tables.find((t: { name: string }) => t.name === name)
-        .primary_keys;
+      result.tables.find((t: { name: string }) => t.name === name).primary_keys;
 
     expect(primaryKeys('public.membership')).toEqual(['user_id', 'org_id']);
     expect(primaryKeys('public.inc')).toEqual(['a']);
