@@ -1,18 +1,28 @@
-import { Server } from '@modelcontextprotocol/server';
+import { isCallToolResult, Server } from '@modelcontextprotocol/server';
 import type {
+  CallToolResult,
   ClientCapabilities,
   Implementation,
+  InputRequiredResult,
   ListResourcesResult,
   ListResourceTemplatesResult,
   ListToolsResult,
   Tool as McpTool,
   ReadResourceResult,
   ServerCapabilities,
+  ServerContext,
 } from '@modelcontextprotocol/server';
 import { z } from 'zod/v4';
 
 import type { ExtractParams } from './types.js';
 import { assertValidUri, compareUris, matchUriTemplate } from './util.js';
+import { beginObservation } from './observation.js';
+import type {
+  ObservationEnd,
+  ObservedMethod,
+  ToolObservation,
+  RequestObserver,
+} from './observation.js';
 
 export type Scheme = string;
 export type Annotations = NonNullable<
@@ -45,6 +55,7 @@ export type Tool<
   // MCP spec restricts outputSchema to type "object" at the root level:
   // https://modelcontextprotocol.io/specification/2025-11-25/schema#tool-outputschema
   OutputSchema extends z.ZodObject<any> = z.ZodObject<any>,
+  Fact = never,
 > = {
   description: Prop<string>;
   annotations?: Annotations;
@@ -52,7 +63,24 @@ export type Tool<
   outputSchema: OutputSchema;
   /** If true, excludes the tool from `tools/list` while keeping it callable via `tools/call`. */
   hidden?: boolean;
-  execute(params: z.infer<Params>): Promise<z.infer<OutputSchema>>;
+  /**
+   * Executes the tool. `ctx` is the SDK's per-request `ServerContext`
+   * (elicitation, multi-round-trip `requestState`, HTTP info, etc.) — most
+   * tools ignore it.
+   *
+   * Returning an `InputRequiredResult` or a direct `CallToolResult` is
+   * passed straight to the client instead of being JSON-wrapped; any other
+   * value is wrapped as today (`{ content: [{ type: 'text', text:
+   * JSON.stringify(value) }] }`).
+   *
+   * The optional observation handle records custom facts and sets an explicit
+   * outcome. Its methods isolate sink failures and become inert after settlement.
+   */
+  execute: (
+    params: z.infer<Params>,
+    ctx: ServerContext,
+    observation?: ToolObservation<Fact>
+  ) => Promise<z.infer<OutputSchema> | InputRequiredResult | CallToolResult>;
 };
 
 /**
@@ -162,7 +190,8 @@ export function jsonResourceResponse<Uri extends string, Response>(
 export function tool<
   Params extends z.ZodObject<any>,
   OutputSchema extends z.ZodObject<any>,
->(tool: Tool<Params, OutputSchema>) {
+  Fact = never,
+>(tool: Tool<Params, OutputSchema, Fact>) {
   return tool;
 }
 
@@ -194,7 +223,7 @@ export type ToolCallCallback = (details: ToolCallDetails) => void;
 export type PropCallback<T> = () => T | Promise<T>;
 export type Prop<T> = T | PropCallback<T>;
 
-export type McpServerOptions = {
+export type McpServerOptions<Bucket extends string = never, Fact = never> = {
   /**
    * The name of the MCP server. This will be sent to the client as part of
    * the initialization process.
@@ -256,7 +285,31 @@ export type McpServerOptions = {
    * asks for the list of tools or invokes a tool. This allows for dynamic tools
    * that can change after the server has started.
    */
-  tools?: Prop<Record<string, Tool>>;
+  tools?:
+    | Record<string, Tool<z.ZodObject<any>, z.ZodObject<any>, Fact>>
+    | ((
+        ctx?: ServerContext
+      ) =>
+        | Record<string, Tool<z.ZodObject<any>, z.ZodObject<any>, Fact>>
+        | Promise<
+            Record<string, Tool<z.ZodObject<any>, z.ZodObject<any>, Fact>>
+          >);
+
+  /**
+   * Multi-round-trip `requestState` integrity hook (protocol revision
+   * 2026-07-28), passed straight through to the underlying SDK `Server`.
+   *
+   * Configure this with `createRequestStateCodec`'s `verify` to
+   * authenticate `requestState` a tool mints via `inputRequired(...)`.
+   * Leaving it unset keeps the SDK's passthrough behavior.
+   */
+  requestState?: {
+    verify?: (state: string, ctx: ServerContext) => unknown | Promise<unknown>;
+  };
+
+  /** Optional per-request observer; see ObservedMethod for covered handlers. */
+  observer?: RequestObserver<Bucket, Fact>;
+  classifyTool?: (name: string) => Bucket | 'other';
 };
 
 /**
@@ -265,7 +318,9 @@ export type McpServerOptions = {
  * Simplifies the process of creating an MCP server by providing a high-level
  * API for defining resources and tools.
  */
-export function createMcpServer(options: McpServerOptions) {
+export function createMcpServer<Bucket extends string = never, Fact = never>(
+  options: McpServerOptions<Bucket, Fact>
+) {
   const capabilities: ServerCapabilities = {};
 
   if (options.resources) {
@@ -285,6 +340,7 @@ export function createMcpServer(options: McpServerOptions) {
     {
       capabilities,
       instructions: options.instructions,
+      requestState: options.requestState,
     }
   );
 
@@ -298,14 +354,32 @@ export function createMcpServer(options: McpServerOptions) {
       : options.resources;
   }
 
-  async function getTools() {
+  async function getTools(ctx?: ServerContext) {
     if (!options.tools) {
       throw new Error('tools not available');
     }
 
     return typeof options.tools === 'function'
-      ? await options.tools()
+      ? await options.tools(ctx)
       : options.tools;
+  }
+
+  async function observed<Result extends object>(
+    method: Exclude<ObservedMethod, 'tools/call'>,
+    run: () => Promise<Result>
+  ): Promise<Result> {
+    const scope = beginObservation(options.observer, { method });
+    let outcome: ObservationEnd['result'] = 'handler_error';
+    try {
+      const result = await run();
+      outcome =
+        'isError' in result && result.isError === true
+          ? 'tool_error'
+          : 'completed';
+      return result;
+    } finally {
+      scope?.end(outcome);
+    }
   }
 
   server.oninitialized = async () => {
@@ -331,148 +405,169 @@ export function createMcpServer(options: McpServerOptions) {
   if (options.resources) {
     server.setRequestHandler(
       'resources/list',
-      async (): Promise<ListResourcesResult> => {
-        const allResources = await getResources();
-        return {
-          resources: allResources
-            .filter((resource) => 'uri' in resource)
-            .map(({ uri, name, description, mimeType }) => {
-              return {
-                uri,
-                name,
-                description,
-                mimeType,
-              };
-            }),
-        };
-      }
+      (): Promise<ListResourcesResult> =>
+        observed('resources/list', async () => {
+          const allResources = await getResources();
+          return {
+            resources: allResources
+              .filter((resource) => 'uri' in resource)
+              .map(({ uri, name, description, mimeType }) => {
+                return {
+                  uri,
+                  name,
+                  description,
+                  mimeType,
+                };
+              }),
+          };
+        })
     );
 
     server.setRequestHandler(
       'resources/templates/list',
-      async (): Promise<ListResourceTemplatesResult> => {
-        const allResources = await getResources();
-        return {
-          resourceTemplates: allResources
-            .filter((resource) => 'uriTemplate' in resource)
-            .map(({ uriTemplate, name, description, mimeType }) => {
-              return {
-                uriTemplate,
-                name,
-                description,
-                mimeType,
-              };
-            }),
-        };
-      }
+      (): Promise<ListResourceTemplatesResult> =>
+        observed('resources/templates/list', async () => {
+          const allResources = await getResources();
+          return {
+            resourceTemplates: allResources
+              .filter((resource) => 'uriTemplate' in resource)
+              .map(({ uriTemplate, name, description, mimeType }) => {
+                return {
+                  uriTemplate,
+                  name,
+                  description,
+                  mimeType,
+                };
+              }),
+          };
+        })
     );
 
     server.setRequestHandler(
       'resources/read',
-      async (request): Promise<ReadResourceResult> => {
-        try {
-          const allResources = await getResources();
-          const { uri } = request.params;
+      (request): Promise<ReadResourceResult> =>
+        observed('resources/read', async () => {
+          try {
+            const allResources = await getResources();
+            const { uri } = request.params;
 
-          const resources = allResources.filter(
-            (resource) => 'uri' in resource
-          );
-          const resource = resources.find((resource) =>
-            compareUris(resource.uri, uri)
-          );
+            const resources = allResources.filter(
+              (resource) => 'uri' in resource
+            );
+            const resource = resources.find((resource) =>
+              compareUris(resource.uri, uri)
+            );
 
-          if (resource) {
-            const result = await resource.read(uri as `${string}://${string}`);
+            if (resource) {
+              const result = await resource.read(
+                uri as `${string}://${string}`
+              );
+
+              const contents = Array.isArray(result) ? result : [result];
+
+              return {
+                contents,
+              };
+            }
+
+            const resourceTemplates = allResources.filter(
+              (resource) => 'uriTemplate' in resource
+            );
+            const resourceTemplateUris = resourceTemplates.map(
+              ({ uriTemplate }) => assertValidUri(uriTemplate)
+            );
+
+            const templateMatch = matchUriTemplate(uri, resourceTemplateUris);
+
+            if (!templateMatch) {
+              throw new Error('resource not found');
+            }
+
+            const resourceTemplate = resourceTemplates.find(
+              (r) => r.uriTemplate === templateMatch.uri
+            );
+
+            if (!resourceTemplate) {
+              throw new Error('resource not found');
+            }
+
+            const result = await resourceTemplate.read(
+              uri as `${string}://${string}`,
+              templateMatch.params
+            );
 
             const contents = Array.isArray(result) ? result : [result];
 
             return {
               contents,
             };
+          } catch (error) {
+            // Preserve the existing resource error payload despite the SDK result type.
+            return {
+              isError: true,
+              content: [
+                {
+                  type: 'text',
+                  text: JSON.stringify({ error: enumerateError(error) }),
+                },
+              ],
+            } as unknown as ReadResourceResult;
           }
-
-          const resourceTemplates = allResources.filter(
-            (resource) => 'uriTemplate' in resource
-          );
-          const resourceTemplateUris = resourceTemplates.map(
-            ({ uriTemplate }) => assertValidUri(uriTemplate)
-          );
-
-          const templateMatch = matchUriTemplate(uri, resourceTemplateUris);
-
-          if (!templateMatch) {
-            throw new Error('resource not found');
-          }
-
-          const resourceTemplate = resourceTemplates.find(
-            (r) => r.uriTemplate === templateMatch.uri
-          );
-
-          if (!resourceTemplate) {
-            throw new Error('resource not found');
-          }
-
-          const result = await resourceTemplate.read(
-            uri as `${string}://${string}`,
-            templateMatch.params
-          );
-
-          const contents = Array.isArray(result) ? result : [result];
-
-          return {
-            contents,
-          };
-        } catch (error) {
-          return {
-            isError: true,
-            content: [
-              {
-                type: 'text',
-                text: JSON.stringify({ error: enumerateError(error) }),
-              },
-            ],
-          } as any;
-        }
-      }
+        })
     );
   }
 
   if (options.tools) {
     server.setRequestHandler(
       'tools/list',
-      async (): Promise<ListToolsResult> => {
-        const tools = await getTools();
+      (_request, ctx): Promise<ListToolsResult> =>
+        observed('tools/list', async () => {
+          const tools = await getTools(ctx);
 
-        return {
-          tools: await Promise.all(
-            Object.entries(tools)
-              .filter(([, tool]) => !tool.hidden)
-              .map(async ([name, { description, annotations, parameters }]) => {
-                const inputSchema = z.toJSONSchema(parameters, {
-                  target: 'draft-7',
-                });
+          return {
+            tools: await Promise.all(
+              Object.entries(tools)
+                .filter(([, tool]) => !tool.hidden)
+                .map(
+                  async ([name, { description, annotations, parameters }]) => {
+                    const inputSchema = z.toJSONSchema(parameters, {
+                      target: 'draft-7',
+                    });
 
-                return {
-                  name,
-                  description:
-                    typeof description === 'function'
-                      ? await description()
-                      : description,
-                  annotations,
-                  // Casting the same as the SDK does:
-                  // https://github.com/modelcontextprotocol/typescript-sdk/blob/fb07af810b51003c338dc4885a9e42f54519f9af/src/server/mcp.ts#L154
-                  inputSchema: inputSchema as McpTool['inputSchema'],
-                };
-              })
-          ),
-        } satisfies ListToolsResult;
-      }
+                    return {
+                      name,
+                      description:
+                        typeof description === 'function'
+                          ? await description()
+                          : description,
+                      annotations,
+                      // Casting the same as the SDK does:
+                      // https://github.com/modelcontextprotocol/typescript-sdk/blob/fb07af810b51003c338dc4885a9e42f54519f9af/src/server/mcp.ts#L154
+                      inputSchema: inputSchema as McpTool['inputSchema'],
+                    };
+                  }
+                )
+            ),
+          } satisfies ListToolsResult;
+        })
     );
 
-    server.setRequestHandler('tools/call', async (request) => {
+    server.setRequestHandler('tools/call', async (request, ctx) => {
+      const toolName = request.params.name;
+      let tool: Bucket | 'other' = 'other';
+      if (options.observer) {
+        try {
+          tool = options.classifyTool?.(toolName) ?? 'other';
+        } catch {}
+      }
+      const scope = beginObservation(options.observer, {
+        method: 'tools/call',
+        tool,
+      });
+      let outcome: ObservationEnd['result'] = 'handler_error';
+
       try {
-        const tools = await getTools();
-        const toolName = request.params.name;
+        const tools = await getTools(ctx);
 
         if (!(toolName in tools)) {
           throw new Error('tool not found');
@@ -487,10 +582,12 @@ export function createMcpServer(options: McpServerOptions) {
           .strict()
           .parse(request.params.arguments ?? {});
 
-        const executeWithCallback = async (tool: Tool) => {
+        const executeWithCallback = async (
+          tool: Tool<z.ZodObject<any>, z.ZodObject<any>, Fact>
+        ) => {
           // Wrap success or error in a result value
           const res = await tool
-            .execute(args)
+            .execute(args, ctx, scope?.tool)
             .then((data: unknown) => ({ success: true as const, data }))
             .catch((error) => ({ success: false as const, error }));
 
@@ -515,16 +612,32 @@ export function createMcpServer(options: McpServerOptions) {
 
         const result = await executeWithCallback(tool);
 
+        // An InputRequiredResult is already shaped for the wire.
+        if (isInputRequiredResult(result)) {
+          outcome = 'input_required';
+          return result;
+        }
+
+        // A direct CallToolResult is already shaped for the wire; pass it
+        // through instead of JSON-wrapping it.
+        if (isCallToolResult(result)) {
+          outcome = result.isError
+            ? 'tool_error'
+            : (scope?.outcome() ?? 'completed');
+          return result;
+        }
+
         const content =
           result != null
             ? [{ type: 'text' as const, text: JSON.stringify(result) }]
             : [];
 
+        outcome = scope?.outcome() ?? 'completed';
         return {
           content,
         };
       } catch (error) {
-        return {
+        const result = {
           isError: true,
           content: [
             {
@@ -532,12 +645,24 @@ export function createMcpServer(options: McpServerOptions) {
               text: JSON.stringify({ error: enumerateError(error) }),
             },
           ],
-        };
+        } satisfies CallToolResult;
+        outcome = 'tool_error';
+        return result;
+      } finally {
+        scope?.end(outcome);
       }
     });
   }
 
   return server;
+}
+
+function isInputRequiredResult(value: unknown): value is InputRequiredResult {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    (value as { resultType?: unknown }).resultType === 'input_required'
+  );
 }
 
 function enumerateError(error: unknown) {

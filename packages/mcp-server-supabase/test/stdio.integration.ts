@@ -27,7 +27,7 @@ type SetupOptions = {
 };
 
 function assertStdioBuildIsFresh() {
-  const buildPath = 'dist/transports/stdio.js';
+  const buildPath = 'dist/cli.js';
   const newestSource = readdirSync('src', {
     recursive: true,
     withFileTypes: true,
@@ -86,7 +86,7 @@ async function setup(options: SetupOptions = {}) {
   });
 
   const command = 'node';
-  const args = ['dist/transports/stdio.js'];
+  const args = ['dist/cli.js'];
 
   if (accessToken) {
     args.push('--access-token', accessToken);
@@ -239,6 +239,7 @@ describe('stdio', () => {
         'create_branch',
         'create_project',
         'delete_branch',
+        'delete_feedback',
         'deploy_edge_function',
         'execute_sql',
         'generate_typescript_types',
@@ -263,6 +264,7 @@ describe('stdio', () => {
         'reset_branch',
         'restore_project',
         'search_docs',
+        'submit_feedback',
       ]);
       expect(client.getServerVersion()).toEqual({
         name: 'supabase',

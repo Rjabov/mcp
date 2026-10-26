@@ -1,24 +1,60 @@
 import {
+  CLIENT_INFO_META_KEY,
+  createRequestStateCodec,
+  type Implementation,
+  isSpecType,
+  type ServerContext,
+} from '@modelcontextprotocol/server';
+import {
   createMcpServer,
   type Tool,
   type ToolCallCallback,
 } from '@supabase/mcp-utils';
 import packageJson from '../package.json' with { type: 'json' };
+import { z } from 'zod/v4';
+import type {
+  ObservationFact,
+  ObservedTool,
+  RequestObserver,
+} from './observation.js';
 import { createContentApiClient } from './content-api/index.js';
 import type { SupabasePlatform } from './platform/types.js';
 import { getAccountTools } from './tools/account-tools.js';
 import { getBranchingTools } from './tools/branching-tools.js';
+import {
+  type ElicitationState,
+  isFormCapable,
+  isUrlCapable,
+} from './tools/confirmation.js';
 import { getDatabaseTools } from './tools/database-operation-tools.js';
 import { getDebuggingTools } from './tools/debugging-tools.js';
 import { getDevelopmentTools } from './tools/development-tools.js';
 import { getDocsTools } from './tools/docs-tools.js';
 import { getEdgeFunctionTools } from './tools/edge-function-tools.js';
+import { getFeedbackTools } from './tools/feedback-tools.js';
+import { getNotebookTools } from './tools/notebook-tools.js';
+import {
+  assertValidConnectUrlTemplate,
+  getSecretTools,
+} from './tools/secret-tools.js';
 import { getStorageTools } from './tools/storage-tools.js';
 import { writeToolSet } from './tools/tool-schemas.js';
-import type { FeatureGroup } from './types.js';
+import {
+  CURRENT_ELICITATION_TOOLS,
+  type ElicitationToolName,
+  type FeatureGroup,
+} from './types.js';
 import { parseFeatureGroups } from './util.js';
 
 const { version } = packageJson;
+
+// Clients on protocol 2026-07-28 send their info in each request instead of an initialize handshake
+function getRequestClientInfo(ctx: ServerContext | undefined) {
+  const envelope = ctx?.mcpReq.envelope;
+  if (!envelope || !(CLIENT_INFO_META_KEY in envelope)) return undefined;
+  const client = envelope[CLIENT_INFO_META_KEY];
+  return isSpecType.Implementation(client) ? client : undefined;
+}
 
 export type SupabaseMcpServerOptions = {
   /**
@@ -30,6 +66,8 @@ export type SupabaseMcpServerOptions = {
    * The API URL for the Supabase Content API.
    */
   contentApiUrl?: string;
+  /** Dashboard base URL for notebook links. Defaults to the production dashboard. */
+  dashboardUrl?: string;
 
   /**
    * The project ID to scope the server to.
@@ -46,7 +84,7 @@ export type SupabaseMcpServerOptions = {
 
   /**
    * Features to enable.
-   * Options: 'account', 'branching', 'database', 'debugging', 'development', 'docs', 'functions', 'storage'
+   * Options: 'account', 'branching', 'database', 'debugging', 'development', 'docs', 'feedback', 'functions', 'notebooks', 'storage'
    */
   features?: string[];
 
@@ -54,6 +92,57 @@ export type SupabaseMcpServerOptions = {
    * Callback for after a supabase tool is called.
    */
   onToolCall?: ToolCallCallback;
+
+  /**
+   * The connected MCP client. Hosts that serve legacy clients statelessly must
+   * pass the client from their restored session, since a fresh server never
+   * sees `initialize`. Requests and handshakes the server sees take precedence.
+   */
+  clientInfo?: Implementation;
+
+  /** Optional per-request observer; see ObservedMethod for covered handlers. */
+  observer?: RequestObserver;
+
+  /**
+   * Signed multi-round-trip elicitation config. `requestState` is the shared
+   * HMAC codec config used by every elicitation feature this server issues;
+   * enable features by setting their sub-options.
+   */
+  elicitation?: {
+    requestState: {
+      /** HMAC key for the `requestState` codec. MUST be at least 32 bytes. */
+      key: string | Uint8Array;
+      /** The authenticated principal `requestState` is bound to. */
+      principal: string;
+      /** How long a minted `requestState` stays valid, in seconds. */
+      ttlSeconds?: number;
+    };
+    /**
+     * Form confirmation for the listed cost, destructive SQL and notebook
+     * tools. Clients without form capability run raw SQL without a prompt,
+     * but cannot run mutating notebook cells when confirmation is enabled.
+     * Cost tools keep the legacy `get_cost` -> `confirm_cost` ->
+     * `confirm_cost_id` flow.
+     */
+    confirmation?: {
+      /** Tools that accept a confirmation elicitation. Empty disables all forms. */
+      enabledTools: readonly ElicitationToolName[];
+    };
+    /**
+     * URL-mode secret collection for `create_edge_function_secret`. Requires
+     * `platform.secrets` and the functions feature group. Only URL-capable
+     * clients get the tool.
+     */
+    secretCollection?: {
+      /**
+       * URL template of the dashboard page that collects the secret value.
+       * MUST contain the `{ref}` and `{name}` placeholders; each is replaced
+       * with the percent-encoded project ref and secret name.
+       * Example: `https://supabase.com/dashboard/mcp/secrets?ref={ref}&name={name}`.
+       */
+      connectUrlTemplate: string;
+    };
+  };
 };
 
 const DEFAULT_FEATURES: FeatureGroup[] = [
@@ -64,6 +153,7 @@ const DEFAULT_FEATURES: FeatureGroup[] = [
   'development',
   'functions',
   'branching',
+  'feedback',
 ];
 
 export const PLATFORM_INDEPENDENT_FEATURES: FeatureGroup[] = ['docs'];
@@ -72,8 +162,9 @@ export const instructions = `
 Here are guidelines for using Supabase tools effectively:
 
 - Before making schema changes, inspect the existing tables so you understand the current structure
-- When debugging issues, start by reading the project's logs and its security and performance advisories before making changes
+- When debugging issues, start by reading the project's logs and its security, performance, and health advisories before making changes
 - Look up the project's API URL and its publishable API keys when helping users configure client-side integrations
+- SQL runs on the project's database server. Never read server-side files or run OS commands via SQL.
 
 If you have access to a local development environment with a filesystem and shell:
 - Install the Supabase agent skill for critical development and security guidance: \`npx skills add supabase/agent-skills\` (https://supabase.com/docs/guides/getting-started/ai-skills.md)
@@ -95,9 +186,17 @@ export function createSupabaseMcpServer(options: SupabaseMcpServerOptions) {
     readOnly,
     features,
     contentApiUrl = 'https://supabase.com/docs/api/graphql',
+    dashboardUrl,
     onToolCall,
+    observer,
+    elicitation,
   } = options;
 
+  if (elicitation?.secretCollection) {
+    assertValidConnectUrlTemplate(
+      elicitation.secretCollection.connectUrlTemplate
+    );
+  }
   const contentApiClientPromise = createContentApiClient(contentApiUrl, {
     'User-Agent': `supabase-mcp/${version}`,
   });
@@ -115,12 +214,28 @@ export function createSupabaseMcpServer(options: SupabaseMcpServerOptions) {
     features ?? availableDefaultFeatures
   );
 
-  const server = createMcpServer({
+  const enabledConfirmationTools =
+    elicitation?.confirmation?.enabledTools ?? [];
+  const elicitationCodec =
+    elicitation &&
+    (enabledConfirmationTools.length > 0 || elicitation.secretCollection)
+      ? createRequestStateCodec<ElicitationState>({
+          key: elicitation.requestState.key,
+          ttlSeconds: elicitation.requestState.ttlSeconds,
+          bind: (ctx) =>
+            `${ctx.mcpReq.method}:${elicitation.requestState.principal}`,
+        })
+      : undefined;
+
+  let handshakeClientInfo: Implementation | undefined;
+
+  const server = createMcpServer<ObservedTool, ObservationFact>({
     name: 'supabase',
     title: 'Supabase',
     version,
     instructions,
     async onInitialize(info) {
+      handshakeClientInfo = info.clientInfo;
       // Note: in stateless HTTP mode, `onInitialize` will not always be called
       // so we cannot rely on it for initialization. It's still useful for telemetry.
       const { clientInfo } = info;
@@ -134,10 +249,18 @@ export function createSupabaseMcpServer(options: SupabaseMcpServerOptions) {
       ]);
     },
     onToolCall,
-    tools: async () => {
+    observer,
+    classifyTool: (name) =>
+      (CURRENT_ELICITATION_TOOLS as readonly string[]).includes(name)
+        ? (name as ElicitationToolName)
+        : 'other',
+    requestState: elicitationCodec && {
+      verify: elicitationCodec.verify,
+    },
+    tools: async (ctx) => {
+      const clientInfo =
+        getRequestClientInfo(ctx) ?? handshakeClientInfo ?? options.clientInfo;
       const contentApiClient = await contentApiClientPromise;
-      const tools: Record<string, Tool> = {};
-
       const {
         account,
         database,
@@ -146,14 +269,32 @@ export function createSupabaseMcpServer(options: SupabaseMcpServerOptions) {
         development,
         storage,
         branching,
+        secrets,
+        notebooks,
+        feedback,
       } = platform;
+      const tools: Record<
+        string,
+        Tool<z.ZodObject<any>, z.ZodObject<any>, ObservationFact>
+      > = {};
 
       if (enabledFeatures.has('docs')) {
         Object.assign(tools, getDocsTools({ contentApiClient }));
       }
 
       if (!projectId && account && enabledFeatures.has('account')) {
-        Object.assign(tools, getAccountTools({ account, readOnly }));
+        Object.assign(
+          tools,
+          getAccountTools({
+            account,
+            readOnly,
+            confirmation:
+              elicitationCodec &&
+              enabledConfirmationTools.includes('create_project')
+                ? { codec: elicitationCodec }
+                : undefined,
+          })
+        );
       }
 
       if (database && enabledFeatures.has('database')) {
@@ -163,6 +304,18 @@ export function createSupabaseMcpServer(options: SupabaseMcpServerOptions) {
             database,
             projectId,
             readOnly,
+            confirmation:
+              elicitationCodec &&
+              (enabledConfirmationTools.includes('execute_sql') ||
+                enabledConfirmationTools.includes('apply_migration'))
+                ? {
+                    codec: elicitationCodec,
+                    enabledTools: enabledConfirmationTools.filter(
+                      (tool): tool is 'execute_sql' | 'apply_migration' =>
+                        tool === 'execute_sql' || tool === 'apply_migration'
+                    ),
+                  }
+                : undefined,
           })
         );
       }
@@ -185,12 +338,67 @@ export function createSupabaseMcpServer(options: SupabaseMcpServerOptions) {
       if (branching && enabledFeatures.has('branching')) {
         Object.assign(
           tools,
-          getBranchingTools({ branching, projectId, readOnly })
+          getBranchingTools({
+            branching,
+            projectId,
+            readOnly,
+            confirmation:
+              elicitationCodec &&
+              enabledConfirmationTools.includes('create_branch')
+                ? { codec: elicitationCodec }
+                : undefined,
+          })
         );
       }
 
       if (storage && enabledFeatures.has('storage')) {
         Object.assign(tools, getStorageTools({ storage, projectId, readOnly }));
+      }
+
+      if (notebooks && enabledFeatures.has('notebooks')) {
+        Object.assign(
+          tools,
+          getNotebookTools({
+            notebooks,
+            // Feature groups control tool discovery, not the operations that
+            // notebook cells can run. The notebooks group owns this tool.
+            database,
+            debugging,
+            projectId,
+            dashboardUrl,
+            readOnly,
+            confirmation:
+              elicitationCodec &&
+              enabledConfirmationTools.includes('run_notebook')
+                ? { codec: elicitationCodec }
+                : undefined,
+          })
+        );
+      }
+
+      if (feedback && enabledFeatures.has('feedback')) {
+        Object.assign(
+          tools,
+          getFeedbackTools({ feedback, projectId, clientInfo, readOnly })
+        );
+      }
+
+      if (
+        elicitation?.secretCollection &&
+        secrets &&
+        elicitationCodec &&
+        enabledFeatures.has('functions')
+      ) {
+        const secretTools = getSecretTools({
+          secrets,
+          projectId,
+          readOnly,
+          codec: elicitationCodec,
+          connectUrlTemplate: elicitation.secretCollection.connectUrlTemplate,
+        });
+        secretTools.create_edge_function_secret.hidden =
+          !ctx || !isUrlCapable(ctx);
+        Object.assign(tools, secretTools);
       }
 
       if (readOnly) {
@@ -201,9 +409,53 @@ export function createSupabaseMcpServer(options: SupabaseMcpServerOptions) {
         }
       }
 
+      // Form-capable clients confirm cost inside the create tools, so those
+      // drop `confirm_cost_id` and the legacy cost tools only offer the types
+      // that still need them. With nothing left to quote they are hidden
+      // entirely.
+      if (
+        elicitationCodec &&
+        elicitation?.confirmation &&
+        ctx &&
+        isFormCapable(ctx)
+      ) {
+        const legacyCostTypes: ('project' | 'branch')[] = [];
+        for (const type of ['project', 'branch'] as const) {
+          const name = `create_${type}` as const;
+          const tool = tools[name];
+          if (!enabledConfirmationTools.includes(name)) {
+            legacyCostTypes.push(type);
+          } else if (tool) {
+            tools[name] = {
+              ...tool,
+              parameters: tool.parameters.omit({ confirm_cost_id: true }),
+            };
+          }
+        }
+
+        for (const name of ['get_cost', 'confirm_cost']) {
+          const tool = tools[name];
+          if (!tool) {
+            continue;
+          }
+          tools[name] = isNonEmpty(legacyCostTypes)
+            ? {
+                ...tool,
+                parameters: tool.parameters.extend({
+                  type: z.enum(legacyCostTypes),
+                }),
+              }
+            : { ...tool, hidden: true };
+        }
+      }
+
       return tools;
     },
   });
 
   return server;
+}
+
+function isNonEmpty<T>(items: readonly T[]): items is readonly [T, ...T[]] {
+  return items.length > 0;
 }

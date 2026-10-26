@@ -1,15 +1,43 @@
-import { tool } from '@supabase/mcp-utils';
+import {
+  inputRequired,
+  type RequestStateCodec,
+  type ServerContext,
+} from '@modelcontextprotocol/server';
+import { type ToolObservation, tool } from '@supabase/mcp-utils';
+import type { ObservationFact } from '../observation.js';
+import { ToolCallerError } from '../errors.js';
 import { z } from 'zod/v4';
 import type { BranchingOperations } from '../platform/types.js';
 import { branchSchema } from '../platform/types.js';
 import { getBranchCost } from '../pricing.js';
 import { hashObject } from '../util.js';
+import {
+  actionOnlyElicitationSchema,
+  branchCostStateSchema,
+  callBeforeConfirmingDescription,
+  checkConfirmationState,
+  confirmCostIdDescription,
+  isFormCapable,
+  observeOperation,
+  missingConfirmCostIdMessage,
+  optionalConfirmCostIdDescription,
+  type ElicitationState,
+} from './confirmation.js';
 import { injectableTool, type ToolDefs } from './util.js';
 
 type BranchingToolsOptions = {
   branching: BranchingOperations;
   projectId?: string;
   readOnly?: boolean;
+  /**
+   * Enables confirmation via elicitation inside `create_branch` for clients
+   * that declare per-request form capability (see `isFormCapable`). Absent,
+   * `create_branch` keeps requiring `confirm_cost_id` from `confirm_cost`
+   * unchanged.
+   */
+  confirmation?: {
+    codec: RequestStateCodec<ElicitationState>;
+  };
 };
 
 const createBranchInputSchema = z.object({
@@ -18,11 +46,16 @@ const createBranchInputSchema = z.object({
   confirm_cost_id: z
     .string({
       error: (issue) =>
-        issue.input === undefined
-          ? 'User must confirm understanding of costs before creating a branch.'
-          : undefined,
+        issue.input === undefined ? missingConfirmCostIdMessage : undefined,
     })
-    .describe('The cost confirmation ID. Call `confirm_cost` first.'),
+    .describe(confirmCostIdDescription),
+});
+
+const createBranchInputSchemaWithElicitation = createBranchInputSchema.extend({
+  confirm_cost_id: z
+    .string()
+    .optional()
+    .describe(optionalConfirmCostIdDescription),
 });
 
 const createBranchOutputSchema = branchSchema;
@@ -73,8 +106,7 @@ const rebaseBranchOutputSchema = z.object({
 
 export const branchingToolDefs = {
   create_branch: {
-    description:
-      'Creates a development branch on a Supabase project. This will apply all migrations from the main project to a fresh branch database. Note that production data will not carry over. The branch will get its own project_id via the resulting project_ref. Use this ID to execute queries and migrations on the branch.',
+    description: `Creates a development branch on a Supabase project, which can incur hourly compute and other usage charges. The user must agree to the cost before the branch is created. ${callBeforeConfirmingDescription} This will apply all migrations from the main project to a fresh branch database. Note that production data will not carry over. The branch will get its own project_id via the resulting project_ref. Use this ID to execute queries and migrations on the branch.`,
     parameters: createBranchInputSchema,
     outputSchema: createBranchOutputSchema,
     annotations: {
@@ -155,26 +187,129 @@ export function getBranchingTools({
   branching,
   projectId,
   readOnly,
+  confirmation,
 }: BranchingToolsOptions) {
   const project_id = projectId;
 
   return {
     create_branch: injectableTool({
       ...branchingToolDefs.create_branch,
+      parameters: confirmation
+        ? createBranchInputSchemaWithElicitation
+        : createBranchInputSchema,
       inject: { project_id },
-      execute: async ({ project_id, name, confirm_cost_id }) => {
+      execute: async (
+        {
+          project_id,
+          name,
+          confirm_cost_id,
+        }: z.infer<typeof createBranchInputSchemaWithElicitation>,
+        ctx: ServerContext,
+        observation?: ToolObservation<ObservationFact>
+      ) => {
+        const receivedAt = Date.now();
         if (readOnly) {
-          throw new Error('Cannot create a branch in read-only mode.');
+          observation?.record({
+            kind: 'confirmation_decision',
+            feature: 'cost',
+            route: 'blocked',
+            reason: 'read_only',
+          });
+          throw new ToolCallerError(
+            'Cannot create a branch in read-only mode.'
+          );
+        }
+
+        if (confirmation && isFormCapable(ctx)) {
+          const { codec } = confirmation;
+          const cost = getBranchCost();
+          observation?.record({
+            kind: 'confirmation_decision',
+            feature: 'cost',
+            route: 'inline',
+            reason: 'eligible',
+          });
+          const costSuffix = { hourly: '/hr' }[cost.recurrence];
+
+          const askForConfirmation = async () => {
+            return inputRequired({
+              inputRequests: {
+                confirm_cost: inputRequired.elicit({
+                  mode: 'form',
+                  message: [
+                    `Preview branch: $${cost.amount}${costSuffix} until deleted (~$${(cost.amount * 24 * 30).toFixed(2)} per 30 days).`,
+                    'Auto-pauses on inactivity.',
+                    'Standard rate, before plan allowances or exemptions.',
+                  ].join('\n'),
+                  requestedSchema: actionOnlyElicitationSchema,
+                }),
+              },
+              requestState: await codec.mint(
+                {
+                  tool: 'create_branch',
+                  project_id,
+                  name,
+                  cost,
+                  issued_at: Date.now(),
+                },
+                ctx
+              ),
+            });
+          };
+
+          const confirmationState = await checkConfirmationState({
+            ctx,
+            tool: 'create_branch',
+            schema: branchCostStateSchema,
+            receivedAt,
+            requestKey: 'confirm_cost',
+            askForConfirmation,
+            observation,
+            argsMatch: (state) =>
+              state.project_id === project_id && state.name === name,
+            payloadMatch: (state) =>
+              state.cost.type === cost.type &&
+              state.cost.recurrence === cost.recurrence &&
+              state.cost.amount === cost.amount,
+            declinedText: 'Branch creation was declined.',
+          });
+          switch (confirmationState.kind) {
+            case 'reprompt':
+            case 'terminal':
+              return confirmationState.result;
+            case 'proceed':
+              return await observeOperation('cost', observation?.record, () =>
+                branching.createBranch(confirmationState.state.project_id, {
+                  name: confirmationState.state.name,
+                })
+              );
+          }
+        }
+
+        // Legacy clients only: form-capable clients returned above. Without
+        // this, a missing ID would hit the opaque hash-mismatch error below.
+        if (!confirm_cost_id) {
+          throw new ToolCallerError(missingConfirmCostIdMessage);
         }
 
         const cost = getBranchCost();
+        // confirmation is the server option enabling inline confirmation; legacy means no form support or no configuration.
+        const reason = confirmation ? 'capability_missing' : 'not_configured';
+        observation?.record({
+          kind: 'confirmation_decision',
+          feature: 'cost',
+          route: 'legacy',
+          reason,
+        });
         const costHash = await hashObject(cost);
         if (costHash !== confirm_cost_id) {
-          throw new Error(
+          throw new ToolCallerError(
             'Cost confirmation ID does not match the expected cost of creating a branch.'
           );
         }
-        return await branching.createBranch(project_id, { name });
+        return await observeOperation('cost', observation?.record, () =>
+          branching.createBranch(project_id, { name })
+        );
       },
     }),
     list_branches: injectableTool({
@@ -188,7 +323,9 @@ export function getBranchingTools({
       ...branchingToolDefs.delete_branch,
       execute: async ({ branch_id }) => {
         if (readOnly) {
-          throw new Error('Cannot delete a branch in read-only mode.');
+          throw new ToolCallerError(
+            'Cannot delete a branch in read-only mode.'
+          );
         }
 
         await branching.deleteBranch(branch_id);
@@ -199,7 +336,7 @@ export function getBranchingTools({
       ...branchingToolDefs.merge_branch,
       execute: async ({ branch_id }) => {
         if (readOnly) {
-          throw new Error('Cannot merge a branch in read-only mode.');
+          throw new ToolCallerError('Cannot merge a branch in read-only mode.');
         }
 
         await branching.mergeBranch(branch_id);
@@ -210,7 +347,7 @@ export function getBranchingTools({
       ...branchingToolDefs.reset_branch,
       execute: async ({ branch_id, migration_version }) => {
         if (readOnly) {
-          throw new Error('Cannot reset a branch in read-only mode.');
+          throw new ToolCallerError('Cannot reset a branch in read-only mode.');
         }
 
         await branching.resetBranch(branch_id, {
@@ -223,7 +360,9 @@ export function getBranchingTools({
       ...branchingToolDefs.rebase_branch,
       execute: async ({ branch_id }) => {
         if (readOnly) {
-          throw new Error('Cannot rebase a branch in read-only mode.');
+          throw new ToolCallerError(
+            'Cannot rebase a branch in read-only mode.'
+          );
         }
 
         await branching.rebaseBranch(branch_id);
