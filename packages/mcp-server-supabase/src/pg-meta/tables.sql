@@ -26,11 +26,8 @@ FROM
   pg_namespace nc
   JOIN pg_class c ON nc.oid = c.relnamespace
   left join (
-    -- Walk indkey positionally: `= any (indkey)` discards the position of each
-    -- column within the key, so rows come back in attnum order rather than
-    -- constraint-definition order. indkey also holds the index's INCLUDE payload
-    -- columns, which are not part of the key -- indnkeyatts bounds it to the real
-    -- key columns. Same ordering guarantee the foreign key subquery below relies on.
+    -- Walk indkey positionally so columns keep key order. indnkeyatts excludes
+    -- INCLUDE columns.
     select
       table_id,
       jsonb_agg(to_jsonb(_pk) - 'ord' order by _pk.ord) as primary_keys
